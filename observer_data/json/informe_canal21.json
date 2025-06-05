@@ -1,0 +1,40 @@
+{
+  "canal_id": "1340764550554980382",
+  "numero_interno": 21,
+  "nombre_canal": "✡𝑹𝒖𝒏𝒂𝒔-𝒀-𝑶𝒕𝒓𝒂𝒔-𝒄𝒐𝒔𝒂𝒔",
+  "tipo_canal": "texto",
+  "categoria": "Información Rol Unity",
+  "historial": {
+    "total_mensajes": 8,
+    "porcentaje_extraido": "100%",
+    "archivos_partes": [
+      "canal21_histo_1.csv"
+    ],
+    "estadisticas_extraccion": {}
+  },
+  "analisis": {
+    "personajes_detectados": 7,
+    "eventos_importantes": 3,
+    "imagenes_encontradas": 2,
+    "calidad_contenido": "media",
+    "tipo_comunicacion": "casual"
+  },
+  "archivos_generados": {
+    "mensajes": "canal21_histo_*.csv",
+    "personajes": "canal21_personajes.csv",
+    "eventos": "canal21_eventos.csv",
+    "imagenes": "canal21_imagenes.csv"
+  },
+  "timestamp_analisis": "2025-06-01T19:28:59.715821",
+  "session_stats": {
+    "inicio": "2025-06-01T19:11:24.465410",
+    "canales_analizados": 0,
+    "mensajes_procesados": 0,
+    "imagenes_descargadas": 0
+  },
+  "metadatos": {
+    "observer_version": "2.0",
+    "ai_requests": 1,
+    "tokens_consumed": 1136
+  }
+}
