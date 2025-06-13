@@ -36,6 +36,7 @@ try:
 except ImportError:
     print("⚠️ Instalando httpx para mejores requests asíncronos...")
     import subprocess
+    import sys
     subprocess.check_call([sys.executable, "-m", "pip", "install", "httpx"])
     import httpx
 
@@ -61,6 +62,106 @@ class CanalInfo:
         return texto_normalizado.lower().replace('-', ' ').replace('_', ' ').strip()
 
 # ============= VISTAS INTERACTIVAS =============
+
+class ForoHilosSelect(discord.ui.Select):
+    """Dropdown especializado para seleccionar hilos de un foro"""
+    def __init__(self, bot, foro, hilos):
+        self.bot = bot
+        self.foro = foro
+        options = []
+        
+        # Crear opciones con información más detallada
+        for hilo in hilos[:25]:  # Límite de Discord
+            # Obtener información adicional del hilo
+            descripcion = f"💬 {hilo.message_count if hasattr(hilo, 'message_count') else '?'} mensajes"
+            if hasattr(hilo, 'created_at'):
+                dias = (datetime.now(hilo.created_at.tzinfo or datetime.now().astimezone().tzinfo) - hilo.created_at).days
+                if dias == 0:
+                    descripcion += " • Creado hoy"
+                elif dias == 1:
+                    descripcion += " • Creado ayer"
+                else:
+                    descripcion += f" • Creado hace {dias} días"
+            
+            options.append(discord.SelectOption(
+                label=hilo.name[:100],
+                value=str(hilo.id),
+                description=descripcion[:100],
+                emoji="🏠" if "casa" in hilo.name.lower() or "residencia" in hilo.name.lower() else "🧵"
+            ))
+        
+        super().__init__(
+            placeholder=f"📂 Selecciona un hilo del foro {foro.name}...",
+            options=options,
+            min_values=1,
+            max_values=1
+        )
+    
+    async def callback(self, interaction: discord.Interaction):
+        try:
+            hilo_id = int(self.values[0])
+            
+            # Obtener el hilo
+            hilo = self.foro.get_thread(hilo_id)
+            if not hilo:
+                # Intentar obtenerlo del guild
+                hilo = interaction.guild.get_thread(hilo_id)
+            
+            if not hilo:
+                await interaction.response.send_message("❌ No puedo acceder a ese hilo.", ephemeral=True)
+                return
+            
+            # Responder primero para evitar timeout
+            await interaction.response.defer()
+            
+            # Crear mensaje de estado
+            status_msg = await interaction.followup.send(f"🔍 **Analizando hilo** {hilo.name}...")
+            
+            # Analizar el hilo
+            analisis = await self.bot.analyzer.analizar_canal(hilo, status_msg)
+            
+            if 'error' in analisis:
+                await status_msg.edit(content=f"❌ {analisis['error']}")
+                return
+            
+            # Crear embed con resultados
+            embed = self.bot.crear_embed_analisis(analisis, es_hilo=True)
+            
+            # Crear nueva vista si el análisis tiene hilos o más eventos
+            nueva_view = None
+            if analisis.get('num_eventos', 0) > 5:
+                # Crear CanalInfo temporal para el hilo
+                canal_info_hilo = CanalInfo(
+                    id=hilo.id,
+                    nombre=hilo.name,
+                    numero=0,  # No importa el número aquí
+                    tipo='hilo'
+                )
+                nueva_view = AnalisisView(self.bot, analisis, canal_info_hilo)
+            
+            # Editar el mensaje con los resultados
+            await status_msg.edit(content=None, embed=embed, view=nueva_view)
+            
+        except Exception as e:
+            print(f"Error en ForoHilosSelect: {e}")
+            import traceback
+            traceback.print_exc()
+            if not interaction.response.is_done():
+                await interaction.response.send_message(f"❌ Error al analizar: {str(e)}", ephemeral=True)
+            else:
+                await interaction.followup.send(f"❌ Error al analizar: {str(e)}", ephemeral=True)
+
+class ForoView(discord.ui.View):
+    """Vista especializada para mostrar hilos de un foro"""
+    def __init__(self, bot, foro, hilos, timeout=300):
+        super().__init__(timeout=timeout)
+        self.bot = bot
+        self.foro = foro
+        self.hilos = hilos
+        
+        # Agregar el selector de hilos
+        if hilos:
+            self.add_item(ForoHilosSelect(bot, foro, hilos))
 
 class HilosSelect(discord.ui.Select):
     """Dropdown para seleccionar hilos"""
@@ -467,8 +568,69 @@ class CanalAnalyzer:
         relacionados['total'] = len(relacionados['foros']) + len(relacionados['hilos_activos'])
         return relacionados
     
-    async def analizar_canal(self, channel: discord.TextChannel, mensaje_status=None) -> Dict:
+    async def listar_hilos_foro(self, forum: discord.ForumChannel) -> List[discord.Thread]:
+        """Lista todos los hilos activos de un foro"""
+        hilos = []
+        
+        try:
+            # Obtener hilos activos
+            for thread in forum.threads:
+                if not thread.archived:
+                    hilos.append(thread)
+            
+            # Obtener hilos archivados recientes
+            async for thread in forum.archived_threads(limit=50):
+                # Solo incluir hilos de los últimos 30 días
+                if hasattr(thread, 'archive_timestamp'):
+                    dias_archivado = (datetime.now() - thread.archive_timestamp).days
+                    if dias_archivado <= 30:
+                        hilos.append(thread)
+            
+            # Ordenar por actividad más reciente
+            hilos.sort(key=lambda x: x.last_message_id or 0, reverse=True)
+            
+        except Exception as e:
+            print(f"Error listando hilos del foro: {e}")
+        
+        return hilos
+    
+    async def analizar_canal(self, channel, mensaje_status=None) -> Dict:
         """Analiza un canal con feedback detallado"""
+        
+        # Verificar si es un foro
+        if isinstance(channel, discord.ForumChannel):
+            print(f"📂 Detectado canal de tipo Foro: {channel.name}")
+            
+            if mensaje_status:
+                await mensaje_status.edit(content=f"📂 **{channel.name} es un foro**. Obteniendo lista de hilos...")
+            
+            # Obtener hilos del foro
+            hilos = await self.listar_hilos_foro(channel)
+            
+            if not hilos:
+                return {
+                    'error': f'El foro {channel.name} no tiene hilos activos o accesibles.',
+                    'tipo_canal': 'foro',
+                    'canal_nombre': channel.name,
+                    'canal_id': channel.id
+                }
+            
+            # Crear resumen del foro
+            return {
+                'canal_nombre': channel.name,
+                'canal_id': channel.id,
+                'tipo_canal': 'foro',
+                'es_foro': True,
+                'total_hilos': len(hilos),
+                'hilos': [{
+                    'id': hilo.id,
+                    'nombre': hilo.name,
+                    'mensajes': hilo.message_count if hasattr(hilo, 'message_count') else 0,
+                    'archivado': hilo.archived if hasattr(hilo, 'archived') else False,
+                    'creado': hilo.created_at.isoformat() if hasattr(hilo, 'created_at') else None
+                } for hilo in hilos[:25]],  # Limitar a 25 para el selector
+                'timestamp_analisis': datetime.now().isoformat()
+            }
         
         # Si ya está en caché, preguntar si re-analizar
         if channel.id in self.analisis_cache:
@@ -488,22 +650,37 @@ class CanalAnalyzer:
         mensajes = []
         mensajes_totales = 0
         autores_unicos = set()
+        personajes_tupperbox = set()  # Para rastrear personajes de Tupperbox
         
         try:
             async for msg in channel.history(limit=2000):  # Aumentamos el límite
                 mensajes_totales += 1
                 
-                # Incluir mensajes de usuarios Y algunos mensajes importantes de bots
-                if msg.content and (not msg.author.bot or len(msg.content) > 100):
-                    mensajes.append({
-                        'id': msg.id,
-                        'autor': msg.author.name,
-                        'contenido': msg.content[:500],
-                        'timestamp': msg.created_at,
-                        'url': msg.jump_url,
-                        'es_bot': msg.author.bot
-                    })
-                    autores_unicos.add(msg.author.name)
+                # Detectar si es un mensaje de Tupperbox (webhook)
+                es_tupperbox = False
+                autor_real = msg.author.name
+                
+                # Los mensajes de Tupperbox vienen de webhooks
+                if msg.webhook_id:
+                    es_tupperbox = True
+                    # El nombre del webhook es el nombre del personaje
+                    autor_real = msg.author.name
+                    personajes_tupperbox.add(autor_real)
+                
+                # Incluir TODOS los mensajes con contenido (usuarios, bots y webhooks)
+                if msg.content:
+                    # Para Tupperbox, siempre incluir. Para otros bots, solo si son largos
+                    if es_tupperbox or not msg.author.bot or len(msg.content) > 100:
+                        mensajes.append({
+                            'id': msg.id,
+                            'autor': autor_real,
+                            'contenido': msg.content[:500],
+                            'timestamp': msg.created_at,
+                            'url': msg.jump_url,
+                            'es_bot': msg.author.bot and not es_tupperbox,
+                            'es_tupperbox': es_tupperbox
+                        })
+                        autores_unicos.add(autor_real)
                 
                 # Actualizar progreso cada 100 mensajes
                 if mensajes_totales % 100 == 0 and mensaje_status:
@@ -511,7 +688,8 @@ class CanalAnalyzer:
                         content=f"📊 **Recolectando mensajes** de #{channel.name}...\n"
                                 f"📈 {mensajes_totales} mensajes revisados\n"
                                 f"💬 {len(mensajes)} mensajes relevantes encontrados\n"
-                                f"👥 {len(autores_unicos)} usuarios únicos"
+                                f"👥 {len(autores_unicos)} usuarios únicos\n"
+                                f"🎭 {len(personajes_tupperbox)} personajes detectados"
                     )
         except discord.Forbidden:
             return {'error': 'No tengo permisos para leer este canal'}
@@ -539,6 +717,10 @@ class CanalAnalyzer:
         resumen_general = ""
         temas_principales = []
         elementos_mundo = set()  # Para acumular elementos únicos del mundo
+        
+        # Obtener lista de personajes de Tupperbox (si no la tenemos ya)
+        if 'personajes_tupperbox' not in locals():
+            personajes_tupperbox = set([msg['autor'] for msg in mensajes if msg.get('es_tupperbox')])
         
         for i, chunk in enumerate(chunks):
             if mensaje_status:
@@ -581,13 +763,20 @@ class CanalAnalyzer:
                 proposito_canal = chunk_analisis['proposito_canal']
                 break
         
+        # Información adicional sobre personajes si se detectaron
+        info_personajes = ""
+        if personajes_tupperbox:
+            info_personajes = f"\n🎭 **Personajes detectados**: {', '.join(sorted(personajes_tupperbox))}"
+        
         analisis_final = {
             'canal_nombre': channel.name,
             'canal_id': channel.id,
             'total_mensajes_revisados': mensajes_totales,
             'mensajes_analizados': len(mensajes),
             'usuarios_unicos': len(autores_unicos),
-            'resumen_general': resumen_general,
+            'personajes_tupperbox': len(personajes_tupperbox),
+            'lista_personajes': list(personajes_tupperbox),
+            'resumen_general': resumen_general + info_personajes,
             'proposito_canal': proposito_canal,
             'temas_principales': temas_principales,
             'elementos_mundo': list(elementos_mundo),  # Convertir set a lista
@@ -610,64 +799,68 @@ class CanalAnalyzer:
     async def _analizar_chunk_con_ia(self, chunk: List[Dict], nombre_canal: str, parte: int, total_partes: int) -> Dict:
         """Analiza un chunk de mensajes con IA"""
         
-        # Preparar mensajes filtrando bots si hay muchos
-        mensajes_filtrados = [m for m in chunk if not m.get('es_bot')] or chunk
-        
+        # Preparar mensajes sin filtrar por bots
         mensajes_texto = "\n".join([
-            f"[{msg['autor']}]: {msg['contenido']}"
-            for msg in mensajes_filtrados[:40]  # Limitamos para no exceder tokens
+            f"[{msg['autor']}]{' (personaje)' if msg.get('es_tupperbox') else ''}: {msg['contenido']}"
+            for msg in chunk[:40]  # Limitamos para no exceder tokens
         ])
+        
+        # Contar personajes únicos en este chunk
+        personajes_en_chunk = set([msg['autor'] for msg in chunk if msg.get('es_tupperbox')])
         
         prompt = f"""
 Analiza estos mensajes del canal #{nombre_canal} (Parte {parte}/{total_partes}).
 
-CONTEXTO: Este es un servidor de roleplay/gaming. Los canales pueden ser:
-- Lugares del mundo (ciudades, puertos, hospitales, etc.)
-- Canales de información (reglas, guías, lore)
-- Canales sociales (charla general, memes)
-- Canales de personajes o facciones
+CONTEXTO: Este es un servidor de roleplay/gaming donde los usuarios usan Tupperbox para interpretar personajes.
+Los mensajes marcados como "(personaje)" son de personajes de roleplay, NO usuarios normales.
 
 MENSAJES:
 {mensajes_texto}
 
 INSTRUCCIONES CRÍTICAS:
-1. Si es la parte 1, IDENTIFICA EL PROPÓSITO EXACTO:
-   - Si es un LUGAR: ¿Qué lugar es? ¿Qué sucede ahí típicamente?
-   - Si es INFORMACIÓN: ¿Sobre qué? (runas, marcas, reglas, guías)
-   - Si es SOCIAL: ¿Qué tipo de interacciones?
-   - Si es ROLEPLAY: ¿Qué historia o situación se desarrolla?
+1. IDENTIFICA EL TIPO DE INTERACCIÓN:
+   - Si ves muchos "(personaje)", es un canal de ROLEPLAY activo
+   - Los nombres sin "(personaje)" pueden ser usuarios OOC o narradores
+   - Presta atención a la narrativa y las acciones entre personajes
 
-2. BUSCA ELEMENTOS ESPECÍFICOS DEL MUNDO:
-   - Nombres de lugares (Puerto Bendito, Hospital Humano, etc.)
-   - Objetos especiales (runas, marcas, artefactos)
-   - Personajes o criaturas mencionadas
-   - Sistemas del juego (niveles, habilidades, etc.)
+2. PARA CANALES DE ROLEPLAY:
+   - Identifica las relaciones entre personajes
+   - Detecta conflictos, alianzas, romances, etc.
+   - Nota lugares mencionados y eventos importantes
+   - Los personajes son los protagonistas, NO los usuarios
 
-3. EVENTOS - No generalices, sé ESPECÍFICO pero CONCISO:
-   - En vez de "conversación general", di "discusión sobre las runas de esclavitud"
-   - En vez de "roleplay", di "batalla entre X e Y en el puerto"
-   - Mantén las descripciones bajo 60 caracteres
-   - Incluye contexto del mundo siempre que sea posible
+3. EVENTOS - Sé MUY ESPECÍFICO sobre lo que ocurre:
+   - En roleplay: "Grace lleva a Arcadio a su casa/taller"
+   - En combate: "Pelea entre [Personaje A] y [Personaje B] en [lugar]"
+   - En social: "[Personaje] revela su pasado traumático a [otro personaje]"
+   - Incluye SIEMPRE los nombres de los personajes involucrados
+
+4. ELEMENTOS DEL MUNDO:
+   - Lugares específicos (Casa de Grace, Puerto Bendito, etc.)
+   - Objetos importantes (armas, inventos, runas)
+   - Sistemas de juego o magia mencionados
+   - Facciones o grupos (Daniel's, etc.)
 
 Responde en JSON:
 {{
-    "resumen": "descripción ESPECÍFICA: qué ES este canal y para QUÉ se usa",
-    "temas": ["tema específico del mundo/servidor"],
+    "resumen": "descripción ESPECÍFICA de la situación/historia que se desarrolla",
+    "temas": ["tema específico del roleplay/historia"],
     "proposito_canal": "roleplay/información/social/reglas/mercado/batalla/otro",
-    "elementos_mundo": ["lugares/objetos/sistemas mencionados"],
+    "elementos_mundo": ["lugares/objetos/sistemas/facciones mencionados"],
     "eventos": [
         {{
-            "tipo": "roleplay/información/conflicto/transacción/encuentro/otro",
-            "descripcion": "descripción ESPECÍFICA con contexto del mundo",
-            "participantes": ["usuario1", "usuario2"],
+            "tipo": "roleplay/encuentro/revelación/conflicto/romance/exploración",
+            "descripcion": "descripción ESPECÍFICA: [Personaje A] hace X con [Personaje B]",
+            "participantes": ["Personaje1", "Personaje2", "etc"],
             "importancia": "alta/media/baja",
-            "elementos_lore": ["elementos específicos mencionados"],
-            "ubicacion": "lugar donde ocurre si se menciona",
-            "cita_relevante": "frase exacta importante"
+            "elementos_lore": ["elementos del mundo involucrados"],
+            "ubicacion": "lugar específico donde ocurre",
+            "cita_relevante": "frase exacta importante del roleplay"
         }}
     ]
 }}
-"""
+
+NOTA: Los "participantes" deben ser los NOMBRES DE LOS PERSONAJES, no los usuarios."""
         
         try:
             # Hacer la llamada asíncrona con timeout
@@ -804,7 +997,45 @@ class ObserverBot(commands.Bot):
     def crear_embed_analisis(self, analisis: Dict, es_hilo: bool = False) -> discord.Embed:
         """Crea un embed con los resultados del análisis"""
         
-        # Título apropiado
+        # Si es un foro, crear embed especial
+        if analisis.get('es_foro') or analisis.get('tipo_canal') == 'foro':
+            embed = discord.Embed(
+                title=f"📂 Foro: {analisis['canal_nombre']}",
+                description=f"Este es un canal de tipo **Foro** con {analisis['total_hilos']} hilos disponibles.\n\n"
+                           f"Selecciona un hilo del menú desplegable para analizarlo en detalle.",
+                color=0x5865F2  # Color morado de Discord para foros
+            )
+            
+            # Mostrar estadísticas del foro
+            if analisis.get('hilos'):
+                # Contar mensajes totales y hilos activos
+                mensajes_totales = sum(h.get('mensajes', 0) for h in analisis['hilos'])
+                hilos_activos = sum(1 for h in analisis['hilos'] if not h.get('archivado', False))
+                
+                embed.add_field(
+                    name="📊 Estadísticas del Foro",
+                    value=f"• **Total de hilos**: {analisis['total_hilos']}\n"
+                          f"• **Hilos activos**: {hilos_activos}\n"
+                          f"• **Mensajes totales**: {mensajes_totales:,}",
+                    inline=True
+                )
+                
+                # Mostrar los primeros 5 hilos como preview
+                hilos_preview = []
+                for i, hilo in enumerate(analisis['hilos'][:5], 1):
+                    estado = "📌" if not hilo.get('archivado', False) else "📦"
+                    hilos_preview.append(f"{estado} **{i}.** {hilo['nombre'][:40]}... ({hilo.get('mensajes', 0)} msgs)")
+                
+                embed.add_field(
+                    name="🏠 Algunos Hilos",
+                    value='\n'.join(hilos_preview),
+                    inline=False
+                )
+            
+            embed.set_footer(text="Usa el menú desplegable abajo para analizar un hilo específico")
+            return embed
+        
+        # Embed normal para canales/hilos
         titulo = f"🧵 Análisis de Hilo: {analisis['canal_nombre']}" if es_hilo else f"📊 Análisis de #{analisis['canal_nombre']}"
         
         # Mejorar la descripción con el propósito del canal
@@ -833,6 +1064,11 @@ class ObserverBot(commands.Bot):
         stats_text = f"• **Mensajes totales**: {analisis['total_mensajes_revisados']:,}\n"
         stats_text += f"• **Mensajes analizados**: {analisis['mensajes_analizados']:,}\n"
         stats_text += f"• **Usuarios únicos**: {analisis['usuarios_unicos']}\n"
+        
+        # Agregar info de personajes si se detectaron
+        if analisis.get('personajes_tupperbox', 0) > 0:
+            stats_text += f"• **Personajes de RP**: {analisis['personajes_tupperbox']}\n"
+        
         stats_text += f"• **Eventos detectados**: {analisis['num_eventos']}"
         
         # Agregar info de canales relacionados si existen
@@ -854,8 +1090,15 @@ class ObserverBot(commands.Bot):
         )
         
         # Temas principales y elementos del mundo
-        if analisis.get('temas_principales') or analisis.get('elementos_mundo'):
+        if analisis.get('temas_principales') or analisis.get('elementos_mundo') or analisis.get('lista_personajes'):
             contenido_tematico = []
+            
+            # Personajes detectados
+            if analisis.get('lista_personajes') and len(analisis['lista_personajes']) > 0:
+                personajes = ', '.join(sorted(analisis['lista_personajes'])[:10])
+                if len(personajes) > 200:
+                    personajes = personajes[:197] + "..."
+                contenido_tematico.append(f'**🎭 Personajes:** {personajes}')
             
             if analisis.get('temas_principales'):
                 temas = ', '.join(analisis['temas_principales'][:5])
@@ -1045,8 +1288,23 @@ class ObserverBot(commands.Bot):
             # Crear embed con resultados
             embed = self.crear_embed_analisis(analisis)
             
-            # Crear vista con botones interactivos
-            view = AnalisisView(self, analisis, canal_info)
+            # Crear vista apropiada según el tipo de canal
+            if analisis.get('es_foro') or analisis.get('tipo_canal') == 'foro':
+                # Vista especial para foros
+                hilos = [
+                    message.guild.get_thread(h['id']) or 
+                    channel.get_thread(h['id']) 
+                    for h in analisis.get('hilos', [])
+                ]
+                hilos = [h for h in hilos if h is not None]  # Filtrar None
+                
+                if hilos:
+                    view = ForoView(self, channel, hilos)
+                else:
+                    view = None
+            else:
+                # Vista normal para canales de texto
+                view = AnalisisView(self, analisis, canal_info)
             
             # Actualizar mensaje con embed y vista
             await status_msg.edit(content=None, embed=embed, view=view)
@@ -1153,7 +1411,8 @@ class ObserverBot(commands.Bot):
                   "• Identifico temas principales de cada canal\n"
                   "• Proporciono links directos a mensajes relevantes\n"
                   "• Resumo la actividad del canal de forma clara\n"
-                  "• Detecto participantes activos y momentos destacados",
+                  "• Detecto participantes activos y momentos destacados\n"
+                  "• **Analizo foros mostrando todos sus hilos**",
             inline=False
         )
         
@@ -1162,7 +1421,8 @@ class ObserverBot(commands.Bot):
             value="• **Botones en resultados** para navegar fácilmente\n"
                   "• **Analizar hilos** directamente desde el análisis\n"
                   "• **Ver más eventos** con un click\n"
-                  "• **Actualizar análisis** cuando lo necesites",
+                  "• **Actualizar análisis** cuando lo necesites\n"
+                  "• **Selector de hilos** para canales de tipo foro",
             inline=False
         )
         
@@ -1171,7 +1431,8 @@ class ObserverBot(commands.Bot):
             value="• Puedo buscar por **número** de canal o por **nombre**\n"
                   "• Los análisis se guardan en caché por 30 minutos\n"
                   "• Incluyo links directos a eventos importantes\n"
-                  "• Proceso hasta 2000 mensajes por canal",
+                  "• Proceso hasta 2000 mensajes por canal\n"
+                  "• Para foros, te muestro todos los hilos disponibles",
             inline=False
         )
         
